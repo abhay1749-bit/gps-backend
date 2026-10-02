@@ -1,304 +1,115 @@
-import express from "express";
-import cors from "cors";
-import crypto from "crypto";
-import { createClient } from "@supabase/supabase-js";
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: "100kb" }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
+const RDM_API_URL =
+  process.env.RDM_API_URL ||
+  "https://api.rdmtrack.com/Assets/getAllAssetsLiveData";
+const DEFAULT_DEVICE_ID = process.env.RDM_DEVICE_ID || "9064";
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const ITRACK_ACCOUNT = process.env.ITRACK_ACCOUNT;
-const ITRACK_PASSWORD = process.env.ITRACK_PASSWORD;
-
-const ITRACK_BASE_URL = "http://api.itrackcare.com";
-
-const supabase =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    : null;
-
-let cachedToken = null;
-let tokenExpiresAt = 0;
-
-// ---------------- HOME ----------------
-
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "GPS Backend",
-    status: "online"
-  });
-});
-
-// ---------------- HEALTH ----------------
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    database: !!supabase,
-    itrack: !!(ITRACK_ACCOUNT && ITRACK_PASSWORD)
-  });
-});
-
-// ---------------- ITRACK TOKEN ----------------
-
-async function getItrackToken() {
-  if (
-    cachedToken &&
-    Date.now() < tokenExpiresAt
-  ) {
-    return cachedToken;
-  }
-
-  if (!ITRACK_ACCOUNT || !ITRACK_PASSWORD) {
-    throw new Error("iTrack credentials are not configured");
-  }
-
-  const time = Math.floor(Date.now() / 1000).toString();
-
-  const passwordMd5 = crypto
-    .createHash("md5")
-    .update(ITRACK_PASSWORD)
-    .digest("hex");
-
-  const signature = crypto
-    .createHash("md5")
-    .update(passwordMd5 + time)
-    .digest("hex");
-
-  const params = new URLSearchParams({
-    time,
-    account: ITRACK_ACCOUNT,
-    signature
-  });
-
-  const response = await fetch(
-    `${ITRACK_BASE_URL}/api/authorization?${params.toString()}`
-  );
-
-  const data = await response.json();
-
-  if (!response.ok || data.code !== 0 || !data.record?.access_token) {
-    throw new Error(
-      data.message || `iTrack authorization failed (code ${data.code})`
-    );
-  }
-
-  cachedToken = data.record.access_token;
-
-  // Refresh before the official 2-hour expiry.
-  tokenExpiresAt = Date.now() + 90 * 60 * 1000;
-
-  return cachedToken;
+function buildRdmForm(deviceId) {
+  const body = new URLSearchParams();
+  body.append("g", "0");
+  body.append("status[]", "MOVING");
+  body.append("status[]", "PARKED");
+  body.append("status[]", "TOW");
+  body.append("status[]", "IDEL");
+  body.append("status[]", "Unreachable");
+  body.append("distanceValue", "51");
+  body.append("speedValue", "51");
+  body.append("parkedValue", "13");
+  body.append("deviceID", String(deviceId));
+  return body;
 }
 
-// ---------------- REAL GPS ----------------
+async function fetchRdm(deviceId) {
+  const response = await fetch(RDM_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Accept": "application/json, text/javascript, */*; q=0.01",
+      "Origin": "https://rdmtrack.com",
+      "Referer": "https://rdmtrack.com/"
+    },
+    body: buildRdmForm(deviceId).toString()
+  });
+
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`RDM returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`);
+  }
+  if (!response.ok) throw new Error(`RDM HTTP ${response.status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+function normalize(rdm, requestedDeviceId) {
+  const item = Array.isArray(rdm?.data)
+    ? (rdm.data.find(x => String(x.deviceID) === String(requestedDeviceId)) || rdm.data[0])
+    : null;
+
+  if (!item) return { ok: false, error: "No live asset data returned by RDM", rdm };
+
+  return {
+    ok: true,
+    source: "RDM",
+    device_id: String(item.deviceID ?? requestedDeviceId),
+    latitude: Number(item.latitude),
+    longitude: Number(item.longitude),
+    speed: Number(item.speed ?? 0),
+    battery: Number(item.batteryLevel ?? 0),
+    heading: Number(item.heading ?? 0),
+    status: item.currentStatus ?? null,
+    power: item.power ?? null,
+    ignition: item.ignition ?? null,
+    ac: item.ac ?? null,
+    device_time: item.deviceTime ?? null,
+    mileage: item.mileAge ?? null,
+    distance_travelled: item.distanceTravelled ?? null,
+    raw: item
+  };
+}
+
+app.get("/", (req, res) => res.json({
+  ok: true,
+  service: "RDM GPS Backend",
+  status: "online",
+  endpoint: "/api/track?device_id=9064"
+}));
+
+app.get("/health", (req, res) => res.json({
+  ok: true,
+  rdm_api: RDM_API_URL,
+  device_id: DEFAULT_DEVICE_ID
+}));
 
 app.get("/api/track", async (req, res) => {
+  const deviceId = req.query.device_id || req.query.deviceID || DEFAULT_DEVICE_ID;
   try {
-    const imeis =
-      req.query.imeis ||
-      req.query.imei ||
-      req.query.device_id;
-
-    if (!imeis) {
-      return res.status(400).json({
-        ok: false,
-        error: "IMEI is required"
-      });
-    }
-
-    const token = await getItrackToken();
-
-    const params = new URLSearchParams({
-      access_token: token,
-      imeis: String(imeis)
-    });
-
-    const response = await fetch(
-      `${ITRACK_BASE_URL}/api/track?${params.toString()}`
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: "iTrack API request failed",
-        details: data
-      });
-    }
-
-    if (data.code !== 0) {
-      return res.status(502).json({
-        ok: false,
-        error: data.message || "iTrack returned an error",
-        code: data.code
-      });
-    }
-
-    const record = Array.isArray(data.record)
-      ? data.record[0]
-      : null;
-
-    if (!record) {
-      return res.json({
-        ok: true,
-        record: [],
-        location: null
-      });
-    }
-
-    res.json({
-      ...data,
-
-      // Easy-to-use normalized location for our app
-      location: {
-        imei: record.imei,
-        latitude: Number(record.latitude),
-        longitude: Number(record.longitude),
-        speed: Number(record.speed || 0),
-        heading: Number(record.course || 0),
-        gps_time: record.gpstime,
-        server_time: record.servertime,
-        heart_time: record.hearttime,
-        data_status: record.datastatus,
-        battery: record.battery
-      }
-    });
-
-  } catch (err) {
-    console.error("TRACK ERROR:", err);
-
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    const result = normalize(await fetchRdm(deviceId), deviceId);
+    res.status(result.ok ? 200 : 502).json(result);
+  } catch (error) {
+    console.error("RDM API error:", error);
+    res.status(502).json({ ok: false, source: "RDM", error: error.message });
   }
 });
 
-// ---------------- SAVE GPS ----------------
-
-app.post("/api/location", async (req, res) => {
+app.get("/api/track/:deviceId", async (req, res) => {
+  const deviceId = req.params.deviceId;
   try {
-    const {
-      device_id,
-      latitude,
-      longitude,
-      accuracy,
-      speed,
-      heading,
-      battery,
-      recorded_at
-    } = req.body;
-
-    if (
-      !device_id ||
-      typeof latitude !== "number" ||
-      typeof longitude !== "number"
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "device_id, latitude and longitude are required"
-      });
-    }
-
-    if (!supabase) {
-      return res.status(503).json({
-        ok: false,
-        error: "Database is not configured"
-      });
-    }
-
-    const { data, error } = await supabase
-      .from("gps_locations")
-      .insert([
-        {
-          device_id,
-          latitude,
-          longitude,
-          accuracy: accuracy ?? null,
-          speed: speed ?? null,
-          heading: heading ?? null,
-          battery: battery ?? null,
-          recorded_at:
-            recorded_at || new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: error.message
-      });
-    }
-
-    res.json({
-      ok: true,
-      location: data
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
+    const result = normalize(await fetchRdm(deviceId), deviceId);
+    res.status(result.ok ? 200 : 502).json(result);
+  } catch (error) {
+    console.error("RDM API error:", error);
+    res.status(502).json({ ok: false, source: "RDM", error: error.message });
   }
 });
 
-// ---------------- LATEST SAVED GPS ----------------
-
-app.get("/api/location/:device_id/latest", async (req, res) => {
-  try {
-    if (!supabase) {
-      return res.status(503).json({
-        ok: false,
-        error: "Database is not configured"
-      });
-    }
-
-    const { data, error } = await supabase
-      .from("gps_locations")
-      .select("*")
-      .eq("device_id", req.params.device_id)
-      .order("recorded_at", {
-        ascending: false
-      })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: error.message
-      });
-    }
-
-    res.json({
-      ok: true,
-      location: data
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
-    });
-  }
-});
-
-// ---------------- START ----------------
-
-app.listen(PORT, () => {
-  console.log(
-    `GPS backend listening on port ${PORT}`
-  );
-});
+app.listen(PORT, () => console.log(`RDM GPS backend listening on port ${PORT}`));
